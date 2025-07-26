@@ -57,14 +57,6 @@ app.use('/api/Subscription', Subscription);
 app.use('/api/stats', Stats);
 app.use('/api/permissions', Permissions);
 
-// Serve static files from frontend
-app.use(express.static(path.join(__dirname, '../frontend')));
-
-// Handle SPA fallback - MUST be last
-app.get('*', (req, res) => {
-  res.sendFile(path.join(__dirname, '../frontend/index.html'));
-});
-
 // Error handling middleware
 app.use((err, req, res, next) => {
   console.error(err.stack);
