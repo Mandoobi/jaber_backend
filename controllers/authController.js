@@ -37,7 +37,6 @@ const loginUser = async (req, res) => {
   const userAgent = req.headers['user-agent'];
   const timestamp = now().toDate();
   const allUsers = await User.find({});
-  console.log('🧾 كل اليوزرات في الداتا:', allUsers.map(u => ({ username: u.username, id: u._id })));
   try {
     const user = await User.findOne({ username });
     if (!user) {
@@ -62,6 +61,9 @@ const loginUser = async (req, res) => {
       );
     }
 
+    const locationObj = await getLocation(ipAddress);
+    const locationString = JSON.stringify(locationObj);
+
     // Create login log
     await LoginLog.create({
       companyId: user.companyId,
@@ -75,7 +77,7 @@ const loginUser = async (req, res) => {
       token,
       tokenExpiresAt: token ? now().add(14, 'day').toDate() : undefined,
       tokenIsActive: !!token,
-      location: await getLocation(ipAddress),
+      location: locationString,
     });
 
     if (loginStatus !== 'success') {
