@@ -3,7 +3,7 @@ const dotenv = require('dotenv');
 const rateLimit = require('express-rate-limit');
 const cors = require('cors');
 const morgan = require('morgan');
-
+const shrinkRay = require('shrink-ray-current'); // ← ADD THIS
 // Load environment variables
 dotenv.config();
 
@@ -31,7 +31,7 @@ const app = express();
 const PORT = process.env.PORT || 5000;
 
 // Middleware
-
+app.use(shrinkRay()); // ← ADD THIS LINE
 app.use(cors({
   origin: 'https://mandoobipro.netlify.app',
   credentials: true
