@@ -13,7 +13,7 @@
     "axios": "^1.10.0",
     "bcrypt": "^6.0.0",
     "bcryptjs": "^3.0.2",
-    "cloudinary": "^2.7.0",
+    "cloudinary": "^1.41.3",
     "cors": "^2.8.5",
     "dayjs": "^1.11.13",
     "dayjs-plugin-utc": "^0.1.2",
