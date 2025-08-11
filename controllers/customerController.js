@@ -5,6 +5,7 @@ const Notification = require('../models/Notification');
 const VisitPlan = require('../models/VisitPlan');
 const User = require('../models/User')
 const DailyReport = require('../models/DailyReport');
+const CustomerAssignment = require('../models/CustomerAssignment');
 const calculateVisitStats = require('../utils/visitStats');
 
 const isValidId = (id) => mongoose.Types.ObjectId.isValid(id);
@@ -37,6 +38,62 @@ const getRankWeight = (rank) => {
   return weights[rank] || 99;
 };
 
+const validateCustomerCode = (code) => {
+  if (!code) return { valid: true };
+  
+  const cleanedCode = code.trim().toUpperCase();
+  
+  if (!/^[A-Z0-9\-]+$/.test(cleanedCode)) {
+    return { 
+      valid: false,
+      message: '❌ كود العميل يجب أن يحتوي على أحرف كابيتال، أرقام وشرطة فقط'
+    };
+  }
+  
+  if (cleanedCode.length < 3 || cleanedCode.length > 20) {
+    return {
+      valid: false,
+      message: '❌ كود العميل يجب أن يكون بين 3 و20 حرفًا'
+    };
+  }
+  
+  return { valid: true, cleanedCode };
+};
+
+const removeCustomerFromAllVisitPlans = async (customerId, companyId) => {
+  try {
+    // Find ALL visit plans in the company
+    const visitPlans = await VisitPlan.find({ companyId });
+
+    // Process each plan
+    for (const plan of visitPlans) {
+      let needsUpdate = false;
+      
+      // Check each day in the plan
+      plan.days = plan.days.map(day => {
+        const originalCount = day.customers.length;
+        day.customers = day.customers.filter(
+          cust => cust.customerId.toString() !== customerId.toString()
+        );
+        
+        if (day.customers.length !== originalCount) {
+          needsUpdate = true;
+        }
+        return day;
+      });
+
+      // Save only if changes were made
+      if (needsUpdate) {
+        await plan.save();
+      }
+    }
+  } catch (error) {
+    console.error('Failed to clean visit plans:', error);
+    throw error;
+  }
+};
+
+
 const createCustomer = async (req, res) => {
   try {
     const companyId = req.user.companyId;
@@ -45,8 +102,20 @@ const createCustomer = async (req, res) => {
       return res.status(400).json({ message: '❌ الشركة المرتبطة بالعميل غير موجودة' });
     }
 
-    // إعداد بيانات العميل
     const customerData = { ...req.body, companyId };
+
+    // Handle customer_code validation and formatting
+    if (req.body.customer_code) {
+      const codeValidation = validateCustomerCode(req.body.customer_code);
+      if (!codeValidation.valid) {
+        return res.status(400).json({ message: codeValidation.message });
+      }
+      customerData.customer_code = codeValidation.cleanedCode;
+    } else {
+      customerData.customer_code = undefined;
+    }
+
+    // Handle rank
     if (req.body.rank && req.body.rank.trim() !== '') {
       customerData.rank = req.body.rank;
       customerData.rankWeight = getRankWeight(req.body.rank);
@@ -55,14 +124,77 @@ const createCustomer = async (req, res) => {
       customerData.rankWeight = null;
     }
 
+    // Handle managerName (optional)
+    if (req.body.managerName && req.body.managerName.trim() !== '') {
+      customerData.managerName = req.body.managerName.trim();
+    } else {
+      customerData.managerName = undefined;
+    }
+
     const newCustomer = new Customer(customerData);
     const savedCustomer = await newCustomer.save();
 
-    // جلب الأدمنات في الشركة
+    // --- Handle sales rep assignments ---
+    let repIds = [];
 
+    if (customerData.isPublic) {
+      repIds = [];
+    } else {
+      if (req.user.role === 'rep' || req.user.role === 'sales') {
+        repIds = [req.user.userId];
+      } else if (req.user.role === 'admin') {
+        if (Array.isArray(req.body.repIds) && req.body.repIds.length > 0) {
+          repIds = req.body.repIds;
+        }
+      }
+    }
+
+    if (repIds.length > 0) {
+      const validReps = await User.find({
+        _id: { $in: repIds },
+        companyId,
+        role: { $in: ['rep', 'sales'] }
+      }).select('_id username companyId role').lean();
+
+      const validRepIds = validReps.map(r => r._id.toString());
+      const invalidRepIds = repIds.filter(id => !validRepIds.includes(id.toString()));
+
+      if (invalidRepIds.length > 0) {
+        return res.status(400).json({
+          message: `❌ هؤلاء المندوبين غير موجودين أو لا ينتمون لشركتك: ${invalidRepIds.join(', ')}`
+        });
+      }
+
+      const assignments = validRepIds.map(repId => ({
+        customerId: savedCustomer._id,
+        repId,
+        assignedBy: req.user.userId,
+      }));
+
+      if (assignments.length > 0) {
+        await CustomerAssignment.insertMany(assignments, { ordered: false }).catch(err => {
+          if (err.code !== 11000) throw err;
+        });
+
+        // Add customer to visit plans of assigned reps with all required fields
+        for (const repId of validRepIds) {
+          let plan = await VisitPlan.findOne({ repId, companyId });
+          if (!plan) {
+            plan = new VisitPlan({
+              repId,
+              companyId,
+              days: Array(7).fill().map(() => ({ customers: [] }))
+            });
+          }
+
+         
+        }
+      }
+    }
+
+    // Create notification
     const adminIds = await getAdmins(req.user.companyId, req.user.userId);
 
-    // إنشاء الإشعار لكل الأدمنات
     Notification.create({
       userId: req.user.userId,
       targetUsers: adminIds,
@@ -80,100 +212,309 @@ const createCustomer = async (req, res) => {
 
   } catch (err) {
     if (err.code === 11000) {
+      if (err.keyPattern.customer_code) {
+        return res.status(400).json({ message: '❌ كود العميل هذا مستخدم مسبقًا' });
+      }
       return res.status(400).json({ message: '❌ العميل موجود مسبقًا' });
     }
-    console.log(err.message);
-    res.status(400).json({ message: '❌ فشل في إنشاء العميل', error: err.message });
+    console.error('Error creating customer:', err);
+    res.status(400).json({ 
+      message: '❌ فشل في إنشاء العميل', 
+      error: process.env.NODE_ENV === 'development' ? err.message : undefined
+    });
+  }
+};
+
+const getAllCustomers = async (req, res) => {
+  try {
+    const companyId = req.user.companyId;
+    if (!companyId) {
+      return res.status(401).json({ message: '❌ لا يوجد تعريف للشركة في التوكن (Unauthorized).' });
+    }
+
+    let { fullName, city, isActive, page, limit, sort, order, rank, repId, customerCode } = req.query;
+    const escapeRegex = (str) => str.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    const query = { companyId: new mongoose.Types.ObjectId(companyId) };
+    
+    if (fullName && fullName.trim() !== '') {
+      const safeFullName = escapeRegex(fullName.trim());
+      query.fullName = { $regex: safeFullName, $options: 'i' };
+    }
+    
+    if (city && city.trim() !== '') {
+      query.city = city.trim();
+    }
+    
+    if (isActive !== undefined) {
+      query.isActive = isActive === 'true';
+    }
+    
+    if (rank && rank.trim() !== '') {
+      query.rank = rank.trim();
+    }
+    
+    if (customerCode && customerCode.trim() !== '') {
+      const safeCustomerCode = escapeRegex(customerCode.trim().toUpperCase());
+      query.customer_code = { $regex: safeCustomerCode, $options: 'i' };
+    }
+
+    const pageNumber = page ? Number(page) : 1;
+    const limitNumber = limit ? Math.min(Number(limit), 50) : 10;
+    const skip = (pageNumber - 1) * limitNumber;
+
+    // Sort options
+    const sortOptions = {};
+    const allowedSortFields = ['fullName', 'city', 'isActive', 'rank', 'customer_code'];
+    const allowedOrders = ['asc', 'desc'];
+
+    if (sort && allowedSortFields.includes(sort)) {
+      sortOptions[sort === 'rank' ? 'rankWeight' : sort] = order === 'desc' ? -1 : 1;
+    } else {
+      sortOptions.fullName = 1;
+    }
+
+    // Handle rep filter for admin
+    if (req.user.role === 'admin' && repId) {
+      const repObjectId = new mongoose.Types.ObjectId(repId);
+      
+      const pipeline = [
+        {
+          $match: query
+        },
+        {
+          $lookup: {
+            from: 'customerassignments',
+            localField: '_id',
+            foreignField: 'customerId',
+            as: 'assignments'
+          }
+        },
+        {
+          $match: {
+            $or: [
+              { isPublic: true },
+              { assignments: { $elemMatch: { repId: repObjectId } } }
+            ]
+          }
+        },
+        { $sort: sortOptions },
+        { $skip: skip },
+        { $limit: limitNumber }
+      ];
+
+      const totalCountPipeline = [
+        { $match: query },
+        {
+          $lookup: {
+            from: 'customerassignments',
+            localField: '_id',
+            foreignField: 'customerId',
+            as: 'assignments'
+          }
+        },
+        {
+          $match: {
+            $or: [
+              { isPublic: true },
+              { assignments: { $elemMatch: { repId: repObjectId } } }
+            ]
+          }
+        },
+        { $count: 'total' }
+      ];
+
+      const totalCustomersArr = await Customer.aggregate(totalCountPipeline);
+      const totalCustomers = totalCustomersArr.length > 0 ? totalCustomersArr[0].total : 0;
+      const totalPages = Math.max(1, Math.ceil(totalCustomers / limitNumber));
+      const currentPage = Math.min(pageNumber, totalPages);
+
+      const customers = await Customer.aggregate(pipeline);
+
+      return res.status(200).json({ customers, totalCustomers, totalPages, currentPage });
+    }
+    // Handle rep/sales user view
+    else if (req.user.role === 'rep' || req.user.role === 'sales') {
+      const userId = new mongoose.Types.ObjectId(req.user.userId);
+
+      const pipeline = [
+        {
+          $match: query
+        },
+        {
+          $lookup: {
+            from: 'customerassignments',
+            localField: '_id',
+            foreignField: 'customerId',
+            as: 'assignments'
+          }
+        },
+        {
+          $match: {
+            $or: [
+              { isPublic: true },
+              { assignments: { $elemMatch: { repId: userId } } }
+            ]
+          }
+        },
+        { $sort: sortOptions },
+        { $skip: skip },
+        { $limit: limitNumber }
+      ];
+
+      const totalCountPipeline = [
+        { $match: query },
+        {
+          $lookup: {
+            from: 'customerassignments',
+            localField: '_id',
+            foreignField: 'customerId',
+            as: 'assignments'
+          }
+        },
+        {
+          $match: {
+            $or: [
+              { isPublic: true },
+              { assignments: { $elemMatch: { repId: userId } } }
+            ]
+          }
+        },
+        { $count: 'total' }
+      ];
+
+      const totalCustomersArr = await Customer.aggregate(totalCountPipeline);
+      const totalCustomers = totalCustomersArr.length > 0 ? totalCustomersArr[0].total : 0;
+      const totalPages = Math.max(1, Math.ceil(totalCustomers / limitNumber));
+      const currentPage = Math.min(pageNumber, totalPages);
+
+      const customers = await Customer.aggregate(pipeline);
+
+      return res.status(200).json({ customers, totalCustomers, totalPages, currentPage });
+    }
+    // Admin view (all customers or filtered by other criteria)
+    else {
+      const totalCustomers = await Customer.countDocuments(query);
+      const totalPages = Math.max(1, Math.ceil(totalCustomers / limitNumber));
+      const currentPage = Math.min(pageNumber, totalPages);
+
+      const customers = await Customer.find(query)
+        .collation({ locale: 'ar', strength: 2 })
+        .skip(skip)
+        .limit(limitNumber)
+        .sort(sortOptions);
+
+      return res.status(200).json({ customers, totalCustomers, totalPages, currentPage });
+    }
+  } catch (error) {
+    console.error('💥 Error in getAllCustomers:', error);
+    res.status(500).json({ 
+      message: '❌ خطأ داخلي في السيرفر عند جلب العملاء', 
+      error: error.message 
+    });
+  }
+};
+
+const getCustomerAssignments = async (req, res) => {
+  const { customerId } = req.query;
+  
+  if (!isValidId(customerId)) {
+    return res.status(400).json({ message: '❌ معرف العميل غير صالح' });
+  }
+
+  try {
+    const companyId = req.user.companyId;
+
+    const customer = await Customer.findOne({ _id: customerId, companyId });
+    if (!customer) {
+      return res.status(404).json({ message: '❌ العميل غير موجود أو ليس ضمن شركتك' });
+    }
+
+    const assignments = await CustomerAssignment.find({ customerId })
+      .populate('repId', 'fullName username')
+      .populate('assignedBy', 'fullName username')
+      .lean();
+
+    res.json({
+      isPublic: customer.isPublic,
+      assignments: assignments.map(a => ({
+        _id: a._id,
+        repId: a.repId?._id,
+        repName: a.repId?.fullName,
+        repUsername: a.repId?.username,
+        assignedById: a.assignedBy?._id,
+        assignedByName: a.assignedBy?.fullName,
+        assignedAt: a.createdAt
+      }))
+    });
+
+  } catch (error) {
+    console.error('Error getting assignments:', error);
+    res.status(500).json({ 
+      message: '❌ فشل في جلب بيانات التعيينات',
+      error: error.message 
+    });
   }
 };
 
 const getCustomerStats = async (req, res) => {
-  const { companyId } = req.user;
+  const { companyId, role, userId } = req.user;
   
   try {
-    // Single optimized aggregation
-    const stats = await Customer.aggregate([
-      {
-        $match: { 
-          companyId: new mongoose.Types.ObjectId(companyId),
-          isActive: true 
-        }
-      },
-      {
-        $facet: {
-          // Pipeline 1: Get total and city distribution
-          totals: [
-            { 
-              $group: { 
-                _id: null,
-                totalActiveCustomers: { $sum: 1 },
-                cities: { $addToSet: "$city" }
-              } 
-            }
-          ],
-          // Pipeline 2: Get top city in parallel
-          topCity: [
-            { 
-              $group: { 
-                _id: "$city", 
-                count: { $sum: 1 } 
-              } 
-            },
-            { $sort: { count: -1 } },
-            { $limit: 1 }
-          ]
-        }
-      },
-      {
-        $project: {
-          totalActiveCustomers: { 
-            $ifNull: [{ $arrayElemAt: ["$totals.totalActiveCustomers", 0] }, 0] 
-          },
-          uniqueCities: { 
-            $size: { 
-              $ifNull: [{ $arrayElemAt: ["$totals.cities", 0] }, []] 
-            } 
-          },
-          topCity: { 
-            $ifNull: [{ $arrayElemAt: ["$topCity._id", 0] }, null] 
-          },
-          topCityCount: { 
-            $ifNull: [{ $arrayElemAt: ["$topCity.count", 0] }, 0] 
-          }
-        }
-      },
-      {
-        $addFields: {
-          avgCustomersPerCity: {
-            $round: [
-              { 
-                $cond: [
-                  { $eq: ["$uniqueCities", 0] },
-                  0,
-                  { $divide: ["$totalActiveCustomers", "$uniqueCities"] }
-                ]
-              },
-              0  // هنا غيرت من 2 إلى 0 عشان يقرب لرقم صحيح فقط
+    // Base query for all users
+    let query = {
+      companyId: new mongoose.Types.ObjectId(companyId),
+      isActive: true
+    };
+
+    // For sales reps, add assignment filter
+    if (role === 'rep' || role === 'sales') {
+      // First get all customer IDs that belong to this company
+      const companyCustomerIds = await Customer.find({ companyId }).distinct('_id');
+      
+      // Then find assignments for this rep only for company customers
+      const assignedCustomerIds = await CustomerAssignment.distinct('customerId', {
+        repId: userId,
+        customerId: { $in: companyCustomerIds }
+      });
+
+      query = {
+        $and: [
+          query,
+          {
+            $or: [
+              { isPublic: true },
+              { _id: { $in: assignedCustomerIds } }
             ]
           }
-        }
-      },
-      { 
-        $project: { 
-          totalActiveCustomers: 1,
-          topCity: 1,
-          topCityCount: 1,
-          avgCustomersPerCity: 1
-        } 
-      }
+        ]
+      };
+    }
+
+    // Get total active customers
+    const totalActiveCustomers = await Customer.countDocuments(query);
+
+    // Get unique cities
+    const cities = await Customer.distinct('city', query);
+
+    // Get top city
+    const topCityResult = await Customer.aggregate([
+      { $match: query },
+      { $group: { _id: "$city", count: { $sum: 1 } } },
+      { $sort: { count: -1 } },
+      { $limit: 1 }
     ]);
 
-    res.json(stats[0] || {
-      totalActiveCustomers: 0,
-      topCity: null,
-      topCityCount: 0,
-      avgCustomersPerCity: 0
-    });
+    const stats = {
+      totalActiveCustomers,
+      uniqueCities: cities.length,
+      topCity: topCityResult[0]?._id || null,
+      topCityCount: topCityResult[0]?.count || 0,
+      avgCustomersPerCity: cities.length > 0 
+        ? Math.round(totalActiveCustomers / cities.length) 
+        : 0
+    };
+
+    res.json(stats);
 
   } catch (error) {
     console.error('Stats Error:', error);
@@ -185,133 +526,6 @@ const getCustomerStats = async (req, res) => {
   }
 };
 
-const getAllCustomers = async (req, res) => {
-  try {
-    const companyId = req.user.companyId;
-    const query = { companyId };
-    if (!companyId) {
-      return res.status(401).json({ message: '❌ لا يوجد تعريف للشركة في التوكن (Unauthorized).' });
-    }
-
-    let { fullName, city, isActive, page, limit, sort, order, rank} = req.query;
-
-    // Validations
-    if (fullName && typeof fullName !== 'string') {
-      return res.status(400).json({ message: '❌ fullName يجب أن يكون نصًا.' });
-    }
-
-    if (city && typeof city !== 'string') {
-      return res.status(400).json({ message: '❌ city يجب أن يكون نصًا.' });
-    }
-
-    if (isActive !== undefined && isActive !== 'true' && isActive !== 'false') {
-      return res.status(400).json({ message: '❌ isActive يجب أن يكون true أو false فقط.' });
-    }
-
-    if (rank && rank.trim() !== '') {
-      query.rank = rank.trim();
-    }
-
-    const allowedSortFields = ['fullName', 'city', 'isActive', 'rank'];
-    const allowedOrders = ['asc', 'desc'];
-
-    if (sort && !allowedSortFields.includes(sort)) {
-      return res.status(400).json({ message: '❌ sort يجب أن يكون fullName أو city أو isActive فقط.' });
-    }
-
-    if (order && !allowedOrders.includes(order)) {
-      return res.status(400).json({ message: '❌ order يجب أن يكون asc أو desc فقط.' });
-    }
-
-    if (page !== undefined) {
-      const pageNum = Number(page);
-      if (isNaN(pageNum) || !Number.isInteger(pageNum) || pageNum < 1) {
-        return res.status(400).json({ message: '❌ page يجب أن يكون رقمًا صحيحًا وأكبر من أو يساوي 1.' });
-      }
-    }
-
-    if (limit !== undefined) {
-      const limitNum = Number(limit);
-      if (isNaN(limitNum) || !Number.isInteger(limitNum) || limitNum < 1) {
-        return res.status(400).json({ message: '❌ limit يجب أن يكون رقمًا صحيحًا وأكبر من أو يساوي 1.' });
-      }
-      if (limitNum > 50) {
-        return res.status(400).json({ message: '❌ limit لا يمكن أن يتجاوز 50.' });
-      }
-    }
-
-    // Build query
-    
-
-    if (fullName && fullName.trim() !== '') {
-      query.fullName = { $regex: fullName.trim(), $options: 'i' };
-    }
-
-    if (city && city.trim() !== '') {
-      query.city = city.trim();
-    }
-
-    if (isActive !== undefined) {
-      query.isActive = isActive === 'true';
-    }
-
-    // Pagination
-    const pageNumber = page ? Number(page) : 1;
-    const limitNumber = limit ? Math.min(Number(limit), 50) : 10;
-
-    const totalCustomers = await Customer.countDocuments(query);
-    const totalPages = Math.max(1, Math.ceil(totalCustomers / limitNumber));
-    const currentPage = Math.min(pageNumber, totalPages);
-    const skip = (currentPage - 1) * limitNumber;
-
-    // Sorting
-    const sortOptions = {};
-    if (sort) {
-      if (sort === 'isActive') {
-        sortOptions.isActive = order === 'desc' ? -1 : 1;
-      } else if (sort === 'rank') {
-        sortOptions.rankWeight = order === 'desc' ? 1 : -1;
-      } else {
-        sortOptions[sort] = order === 'desc' ? -1 : 1;
-      }
-    } else {
-      sortOptions.fullName = 1; // Default sorting by name ascending
-    }
-
-    const customers = await Customer.find(query)
-      .collation({ locale: 'ar', strength: 2 }) // ترتيب أبجدي صحيح بدون حساسية أحرف
-      .skip(skip)
-      .limit(limitNumber)
-      .sort(sortOptions);
-
-
-    res.status(200).json({ customers, totalCustomers, totalPages, currentPage });
-
-  } catch (error) {
-    if (process.env.NODE_ENV !== 'production') {
-      console.error('💥 Error in getAllCustomers:', error);
-    }
-    res.status(500).json({ message: '❌ خطأ داخلي في السيرفر عند جلب العملاء', error: error.message });
-  }
-};
-
-// 🔍 جلب عميل بالـ ID
-const getCustomerById = async (req, res) => {
-  const { id } = req.params;
-  if (!isValidId(id)) {
-    return res.status(400).json({ message: '❌ معرف العميل غير صالح' });
-  }
-  try {
-    const companyId = req.user.companyId;
-    const customer = await Customer.findOne({ _id: id, companyId });
-    if (!customer) {
-      return res.status(404).json({ message: '❌ العميل غير موجود أو ليس ضمن شركتك' });
-    }
-    res.json(customer);
-  } catch (err) {
-    res.status(500).json({ message: '❌ فشل في جلب بيانات العميل', error: err.message });
-  }
-};
 
 const updateCustomer = async (req, res) => {
   const { id } = req.params;
@@ -320,39 +534,211 @@ const updateCustomer = async (req, res) => {
   }
 
   try {
-    // لو فيه rank احسب الوزن تبعها
-    if (req.body.rank) {
-      req.body.rankWeight = getRankWeight(req.body.rank);
+    const companyId = req.user.companyId;
+    const company = await Company.findById(companyId);
+    if (!company) {
+      return res.status(400).json({ message: '❌ الشركة المرتبطة بالعميل غير موجودة' });
     }
 
-    // نجيب العميل قبل التعديل
+    // Get the customer before updating
     const oldCustomer = await Customer.findById(id);
     if (!oldCustomer) {
       return res.status(404).json({ message: '❌ العميل غير موجود' });
     }
 
-    // نحدث العميل
-    const updated = await Customer.findByIdAndUpdate(id, req.body, {
+    // Handle customer_code
+    if (req.body.customer_code !== undefined) {
+      const codeValidation = validateCustomerCode(req.body.customer_code);
+      if (!codeValidation.valid) {
+        return res.status(400).json({ message: codeValidation.message });
+      }
+      req.body.customer_code = codeValidation.cleanedCode || undefined;
+    }
+
+    // Calculate rank weight if rank is provided
+    if (req.body.rank && req.body.rank.trim() !== '') {
+      req.body.rankWeight = getRankWeight(req.body.rank);
+    } else if (req.body.rank === '') {
+      req.body.rank = null;
+      req.body.rankWeight = null;
+    }
+
+    // Handle managerName (optional)
+    if (req.body.managerName !== undefined) {
+      if (req.body.managerName.trim() !== '') {
+        req.body.managerName = req.body.managerName.trim();
+      } else {
+        req.body.managerName = undefined;
+      }
+    }
+
+    // Handle sales rep assignments
+    let repIds = [];
+    let isPublic = req.body.isPublic || false;
+
+    // Get all current assignments before making any changes
+    const oldAssignments = await CustomerAssignment.find({ customerId: id });
+    const oldRepIds = oldAssignments.map(a => a.repId.toString());
+
+    if (isPublic) {
+      // If customer is public, clear all assignments but DON'T remove from visit plans
+      repIds = [];
+      await CustomerAssignment.deleteMany({ customerId: id });
+    } else {
+      if (req.user.role === 'rep' || req.user.role === 'sales') {
+        // Sales rep can only assign to themselves
+        repIds = [req.user.userId];
+      } else if (req.user.role === 'admin') {
+        // Admin can assign multiple reps
+        if (Array.isArray(req.body.repIds) && req.body.repIds.length > 0) {
+          repIds = req.body.repIds;
+        }
+      }
+
+      // Validate the sales reps
+      if (repIds.length > 0) {
+        const validReps = await User.find({
+          _id: { $in: repIds },
+          companyId,
+          role: { $in: ['rep', 'sales'] }
+        }).select('_id username companyId role').lean();
+
+        const validRepIds = validReps.map(r => r._id.toString());
+        const invalidRepIds = repIds.filter(id => !validRepIds.includes(id.toString()));
+
+        if (invalidRepIds.length > 0) {
+          return res.status(400).json({
+            message: `❌ هؤلاء المندوبين غير موجودين أو لا ينتمون لشركتك: ${invalidRepIds.join(', ')}`
+          });
+        }
+
+        // Update assignments
+        await CustomerAssignment.deleteMany({ customerId: id });
+        
+        const assignments = validRepIds.map(repId => ({
+          customerId: id,
+          repId,
+          assignedBy: req.user.userId,
+        }));
+
+        if (assignments.length > 0) {
+          await CustomerAssignment.insertMany(assignments, { ordered: false }).catch(err => {
+            if (err.code !== 11000) throw err;
+          });
+        }
+
+        // FIRST: Remove customer from ALL visit plans of previously assigned reps
+        for (const repId of oldRepIds) {
+          const plan = await VisitPlan.findOne({ repId, companyId });
+          if (plan) {
+            let needsUpdate = false;
+            plan.days = plan.days.map(day => {
+              const originalLength = day.customers.length;
+              day.customers = day.customers.filter(
+                cust => cust.customerId.toString() !== id.toString()
+              );
+              if (day.customers.length !== originalLength) {
+                needsUpdate = true;
+              }
+              return day;
+            });
+            if (needsUpdate) await plan.save();
+          }
+        }
+
+        // THEN: Add customer to visit plans of newly assigned reps with updated info
+        const updatedCustomerData = {
+          ...req.body,
+          isPublic
+        };
+        
+        for (const repId of validRepIds) {
+          let plan = await VisitPlan.findOne({ repId, companyId });
+          if (!plan) {
+            // Create new plan if doesn't exist
+            plan = new VisitPlan({
+              repId,
+              companyId,
+              days: Array(7).fill().map(() => ({ customers: [] }))
+            });
+          }
+
+          // Check if customer already exists in any day
+          const customerExists = plan.days.some(day => 
+            day.customers.some(c => c.customerId.toString() === id.toString())
+          );
+
+          if (!customerExists) {
+            // Add to first day by default with all required fields
+            plan.days[0].customers.push({
+              customerId: id,
+              fullName: updatedCustomerData.fullName || oldCustomer.fullName,
+              customer_code: updatedCustomerData.customer_code || oldCustomer.customer_code,
+              visitOrder: plan.days[0].customers.length + 1
+            });
+            await plan.save();
+          } else {
+            // Update existing customer info in visit plans
+            plan.days = plan.days.map(day => {
+              day.customers = day.customers.map(customer => {
+                if (customer.customerId.toString() === id.toString()) {
+                  return {
+                    ...customer,
+                    fullName: updatedCustomerData.fullName || customer.fullName,
+                    customer_code: updatedCustomerData.customer_code || customer.customer_code
+                  };
+                }
+                return customer;
+              });
+              return day;
+            });
+            await plan.save();
+          }
+        }
+      } else {
+        // No reps assigned and not public - remove all assignments and from all visit plans
+        await CustomerAssignment.deleteMany({ customerId: id });
+        await removeCustomerFromAllVisitPlans(id, companyId);
+        isPublic = false;
+      }
+    }
+
+    // Update the customer
+    const updateData = {
+      ...req.body,
+      isPublic
+    };
+
+    const updatedCustomer = await Customer.findByIdAndUpdate(id, updateData, {
       new: true,
       runValidators: true,
     });
 
-    // احسب التغييرات الحقيقية فقط من اللي جاوا في req.body
+    // Calculate changed fields for notification
     const changedFields = {};
     for (const key of Object.keys(req.body)) {
-      // تجاهل الحقول اللي مالها داعي أو محسوبة تلقائيًا
       if (['updatedAt', 'createdAt', '__v', 'rankWeight'].includes(key)) continue;
 
       const newVal = req.body[key];
       const oldVal = oldCustomer[key];
 
-      // إذا القيمة تغيرت (حتى لو رقم صار ستـرنغ)
       if (newVal?.toString() !== oldVal?.toString()) {
         changedFields[key] = newVal;
       }
     }
 
-    // إذا صار تغييرات فعلًا
+    // Add assignment changes to notification
+    const oldIsPublic = oldCustomer.isPublic || false;
+    
+    if (isPublic !== oldIsPublic) {
+      changedFields.isPublic = isPublic;
+    }
+
+    if (!isPublic && JSON.stringify(repIds.sort()) !== JSON.stringify(oldRepIds.sort())) {
+      changedFields.repIds = repIds;
+    }
+
+    // Create notification if there are changes
     if (Object.keys(changedFields).length > 0) {
       const adminIds = await getAdmins(req.user.companyId, req.user.userId);
 
@@ -365,36 +751,108 @@ const updateCustomer = async (req, res) => {
         relatedEntity: {
           entityType: 'Customer',
           entityId: id,
-        },
+        }
+      }).catch(err => {
+        console.error('Failed to create notification:', err);
       });
     }
 
-    res.json(updated);
+    res.json(updatedCustomer);
   } catch (err) {
     if (err.code === 11000) {
+      if (err.keyPattern.customer_code) {
+        return res.status(400).json({ message: '❌ كود العميل هذا مستخدم مسبقًا' });
+      }
       return res.status(400).json({ message: '❌ العميل موجود مسبقًا' });
     }
-    console.log(err.message)
-    res.status(400).json({ message: '❌ فشل في تحديث بيانات العميل', error: err.message });
+    console.error('Update customer error:', err);
+    res.status(400).json({ 
+      message: '❌ فشل في تحديث بيانات العميل', 
+      error: process.env.NODE_ENV === 'development' ? err.message : undefined
+    });
+  }
+};
+
+// 🔍 جلب عميل بالـ ID
+// 🔍 جلب عميل بالـ ID
+const getCustomerById = async (req, res) => {
+  const { id } = req.params;
+  
+  // التحقق من صحة المعرف
+  if (!isValidId(id)) {
+    return res.status(400).json({ 
+      success: false,
+      message: '❌ معرف العميل غير صالح',
+      error: 'INVALID_CUSTOMER_ID'
+    });
+  }
+
+  try {
+    const companyId = req.user.companyId;
+    
+    // البحث عن العميل مع تضمين معلومات إضافية إذا لزم الأمر
+    const customer = await Customer.findOne({ _id: id, companyId })
+      .select('-__v -createdAt -updatedAt') // استثناء الحقول غير الضرورية
+      .lean();
+
+    if (!customer) {
+      return res.status(404).json({ 
+        success: false,
+        message: '❌ العميل غير موجود أو ليس ضمن شركتك',
+        error: 'CUSTOMER_NOT_FOUND'
+      });
+    }
+
+    // إضافة معلومات إضافية إذا لزم الأمر
+    const result = {
+      ...customer,
+      // يمكن إضافة حقول محسوبة هنا إذا needed
+      isActive: customer.isActive || false, // قيمة افتراضية
+      customer_code: customer.customer_code || 'غير محدد' // قيمة افتراضية
+    };
+
+    res.status(200).json({
+      success: true,
+      data: result
+    });
+
+  } catch (err) {
+    console.error('Error fetching customer:', err);
+    
+    // معالجة أخطاء محددة
+    if (err.name === 'CastError') {
+      return res.status(400).json({
+        success: false,
+        message: '❌ معرف العميل غير صالح',
+        error: 'INVALID_ID_FORMAT'
+      });
+    }
+
+    res.status(500).json({
+      success: false,
+      message: '❌ فشل في جلب بيانات العميل',
+      error: process.env.NODE_ENV === 'development' ? err.message : undefined,
+      errorCode: 'FETCH_CUSTOMER_ERROR'
+    });
   }
 };
 
 const deleteCustomer = async (req, res) => {
   try {
     const { id } = req.params;
-    const { companyId, userId, username } = req.user; // تأكد أن الـ username موجود في req.user
+    const { companyId, userId, username } = req.user;
 
-    // 1. الحصول على بيانات العميل قبل الحذف
+    // 1. Get customer data before deletion
     const customerToDelete = await Customer.findOne({ _id: id, companyId }).lean();
     if (!customerToDelete) {
       return res.status(404).json({ success: false, message: 'Customer not found' });
     }
     const adminIds = await getAdmins(req.user.companyId, req.user.userId);
 
-    // 3. إنشاء إشعار الحذف مع حفظ نسخة العميل في previousData
+    // 2. Create deletion notification
     Notification.create({
       userId: userId,
-      level:"warning",
+      level: "warning",
       targetUsers: adminIds,
       actionType: 'delete_customer',
       description: `المستخدم ${username} حذف العميل ${customerToDelete.fullName}`,
@@ -407,13 +865,10 @@ const deleteCustomer = async (req, res) => {
       console.error('Failed to create notification:', err);
     });
 
-    // 4. إزالة العميل من خطط الزيارة
-    const visitPlanResult = await VisitPlan.updateMany(
-      { companyId },
-      { $pull: { 'days.$[].customers': { customerId: id } } }
-    );
+    // 3. Remove from ALL visit plans
+    await removeCustomerFromAllVisitPlans(id, companyId);
 
-    // 5. معالجة التقارير على دفعات
+    // 4. Process reports in batches
     const BATCH_SIZE = 100;
     let reportsProcessed = 0;
     let batchCount = 0;
@@ -459,7 +914,7 @@ const deleteCustomer = async (req, res) => {
       lastProcessedId = reportsBatch[reportsBatch.length - 1]._id;
     } while (true);
 
-    // 6. حذف العميل من قاعدة البيانات
+    // 5. Delete customer
     const deleteResult = await Customer.deleteOne({ _id: id, companyId });
 
     if (deleteResult.deletedCount === 0) {
@@ -473,7 +928,6 @@ const deleteCustomer = async (req, res) => {
       success: true,
       data: {
         message: 'Customer fully deleted',
-        visitPlansCleaned: visitPlanResult.modifiedCount,
         reportsCleaned: reportsProcessed
       }
     });
@@ -494,5 +948,6 @@ module.exports = {
   getCustomerById,
   updateCustomer,
   deleteCustomer,
-  getCustomerStats
+  getCustomerStats,
+  getCustomerAssignments
 };

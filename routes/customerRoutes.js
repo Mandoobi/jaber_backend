@@ -15,26 +15,28 @@ const {
   getCustomerById,
   updateCustomer,
   deleteCustomer,
-  getCustomerStats
+  getCustomerStats,
+  getCustomerAssignments
 } = require('../controllers/customerController');
 const Customer = require('../models/Customer');
 
 
 router.use(protect, blockDeletedUsers, checkSubscriptionStatus); // 🔥 تعمل لكل الراوترات بعده
 
-router.post('/', protect, authorizeRoles('admin', 'sales'), checkPermission('add_customers'), createCustomer);
+router.post('/', authorizeRoles('admin', 'sales'), checkPermission('add_customers'), createCustomer);
 
-// 👀 عرض كل العملاء (بدون حماية إذا بدك تخليها عامة)
-router.get('/', protect, authorizeRoles('admin', 'sales'), getAllCustomers);
+router.get('/', authorizeRoles('admin', 'sales'), getAllCustomers);
 
-router.get('/stats', protect, authorizeRoles('admin', 'sales'), getCustomerStats);
+router.get('/customer-assignments', authorizeRoles('admin', 'sales'), getCustomerAssignments);
+
+router.get('/stats', authorizeRoles('admin', 'sales'), getCustomerStats);
 // 👀 عرض عميل واحد
-router.get('/:id', protect, authorizeRoles('admin', 'sales'), getCustomerById);
+router.get('/:id', authorizeRoles('admin', 'sales'), getCustomerById);
 
 // ✏️ تعديل عميل
-router.put('/:id', protect, authorizeRoles('admin', 'sales'), checkCompanyOwnership(Customer), checkPermission('edit_customers'), updateCustomer);
+router.put('/:id', authorizeRoles('admin', 'sales'), checkCompanyOwnership(Customer), checkPermission('edit_customers'), updateCustomer);
 
 // 🗑️ حذف عميل
-router.delete('/:id', protect, authorizeRoles('admin', 'sales'), checkCompanyOwnership(Customer), checkPermission('delete_customers'), deleteCustomer);
+router.delete('/:id', authorizeRoles('admin', 'sales'), checkCompanyOwnership(Customer), checkPermission('delete_customers'), deleteCustomer);
 
 module.exports = router;

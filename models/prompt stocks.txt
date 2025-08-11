@@ -1,0 +1,428 @@
+Ok perfect but we now want to do something else how can i track the quantity of products i want if a sales add a sample to the report before sumbitign it check if it really have the amount that he want to give i don't want him to send sampels that he don't have stock of it so how could we do it? if he add to the report and sumbit it is remove the quantity from the same product stokc if he for example cancle it or delete (he or the admin admin can also edit the report sample) it should go back to the stock for the (sales) and the most important i want to have history with it i done all of those but i want to finsh them And also make includeInAnalysis: false; bcz we track how much he get from the start of month so only in reports thing we should use includeInAnalysis false so don't worry about it so let's go how can we done this? Dailyreport controller.js const validateSamples = async (samples, companyId) => {
+  const validationResults = await Promise.all(samples.map(async (s, index) => {
+    const errors = [];
+    
+    // Basic validation
+    if (!s.productId || !mongoose.Types.ObjectId.isValid(s.productId)) {
+      errors.push('Invalid product ID');
+    }
+    if (!s.quantity || s.quantity <= 0) {
+      errors.push('Quantity must be greater than 0');
+    }
+    if (!['customer', 'personal'].includes(s.type)) {
+      errors.push('Invalid sample type');
+    }
+
+    // Validate product exists and belongs to company
+    if (s.productId && mongoose.Types.ObjectId.isValid(s.productId)) {
+      const product = await Product.findOne({
+        _id: s.productId,
+        companyId
+      });
+      if (!product) {
+        errors.push('Product not found or not in company');
+      }
+    }
+
+    // Additional validation for customer samples
+    if (s.type === 'customer') {
+      if (!s.customerId || !mongoose.Types.ObjectId.isValid(s.customerId)) {
+        errors.push('Invalid customer ID');
+      } else {
+        // Validate customer exists and belongs to company
+        const customer = await Customer.findOne({
+          _id: s.customerId,
+          companyId
+        });
+        if (!customer) {
+          errors.push('Customer not found or not in company');
+        }
+      }
+    }
+
+    return {
+      sample: s,
+      isValid: errors.length === 0,
+      errors: errors.length > 0 ? errors : undefined
+    };
+  }));
+
+  return {
+    validSamples: validationResults.filter(r => r.isValid).map(r => r.sample),
+    invalidSamples: validationResults.filter(r => !r.isValid)
+  };
+};
+
+const handleSamples = async (samples, report, userId, companyId, deletedSampleIds = []) => {
+  // First handle deletions
+  if (deletedSampleIds && deletedSampleIds.length > 0) {
+    await Sample.deleteMany({
+      _id: { $in: deletedSampleIds },
+      reportId: report._id,
+      companyId
+    });
+    console.log(`Deleted ${deletedSampleIds.length} samples`);
+  }
+
+  if (!Array.isArray(samples) || !report._id) {
+    return { samplesCount: 0 };
+  }
+
+  const { validSamples, invalidSamples } = await validateSamples(samples, companyId);
+
+  if (invalidSamples.length > 0) {
+    console.log('Sample validation errors:', invalidSamples);
+  }
+
+  if (validSamples.length > 0) {
+    // Prepare samples data with visit linking
+    const samplesToSave = validSamples.map(s => {
+      const sampleData = {
+        companyId,
+        takenBy: userId,
+        productId: s.productId,
+        quantity: s.quantity,
+        type: s.type,
+        reportId: report._id,
+        notes: s.notes || ''
+      };
+
+      // For existing samples, preserve the ID
+      if (s._id) {
+        sampleData._id = s._id;
+      }
+
+      // Add customerId and visitId for customer samples
+      if (s.type === 'customer') {
+        sampleData.customerId = s.customerId;
+      }
+
+      return sampleData;
+    });
+
+    // Use bulkWrite to handle both inserts and updates
+    const bulkOps = samplesToSave.map(sample => ({
+      updateOne: {
+        filter: { _id: sample._id || new mongoose.Types.ObjectId() },
+        update: { $set: sample },
+        upsert: true
+      }
+    }));
+
+    const result = await Sample.bulkWrite(bulkOps);
+    console.log(`Processed ${result.upsertedCount + result.modifiedCount} samples`);
+  }
+
+  return {
+    samplesCount: validSamples.length,
+    invalidSamples: invalidSamples.length > 0 ? invalidSamples : undefined
+  };
+};
+
+// Main controller
+const createOrUpdateReport = async (req, res) => {
+  try {
+    const { role, userId, companyId, username } = req.user;
+
+    // نصوص حتكون كـ string في form-data، لازم parse للحقل المعقد
+    const {
+      notes,
+      reportId,
+      isAdminUpdate = 'false' // لو حبيت تستخدمه لاحقًا
+    } = req.body;
+
+    // parse الحقول المعقدة
+    const visits = req.body.visits ? JSON.parse(req.body.visits) : [];
+    const samples = req.body.samples ? JSON.parse(req.body.samples) : [];
+    const deletedSamples = req.body.deletedSamples ? JSON.parse(req.body.deletedSamples) : [];
+
+    // خذ روابط الصور اللي تم رفعها (cloudinary paths)
+    const images = req.files ? req.files.map(file => file.path) : [];
+
+    // اطبع روابط الصور في الكونسول
+    if (images.length > 0) {
+      console.log('Uploaded image URLs:');
+      images.forEach(url => console.log(url));
+    }
+
+    // Validate visits
+    const { isValid: visitsValid, cleanedVisits, error: visitsError } = validateVisits(visits);
+    if (!visitsValid) {
+      return sendError(res, 400, visitsError);
+    }
+
+    // Validate customers
+    const customerIds = cleanedVisits.map(v => v.customerId);
+    const customersError = await validateCustomers(customerIds, companyId);
+    if (customersError) return sendError(res, 400, customersError);
+
+    const currentDate = now();
+    const dateStr = currentDate.format('YYYY-MM-DD');
+    const day = currentDate.format('dddd');
+
+    // SALES REP LOGIC
+    if (role === 'sales') {
+      let report = await DailyReport.findOne({
+        repId: userId,
+        companyId,
+        date: dateStr
+      });
+
+      if (reportId && (!report || !report._id.equals(reportId))) {
+        return sendError(res, 400, '📛 يمكنك فقط تعديل تقرير اليوم الخاص بك');
+      }
+
+      const processedVisits = await processVisitsForSalesRep(cleanedVisits, userId, companyId, day);
+      const stats = calculateVisitStats(processedVisits);
+
+      if (report) {
+        report.notes = notes || report.notes;
+        report.visits = processedVisits;
+        report.stats = stats;
+
+        // أضف الصور للـ report.images (مثلاً تجمعها كلها)
+        report.images = [...(report.images || []), ...images];
+
+        await report.save();
+      } else {
+        report = new DailyReport({
+          companyId,
+          repId: userId,
+          date: dateStr,
+          day,
+          notes: notes || '',
+          visits: processedVisits,
+          stats,
+          images
+        });
+        await report.save();
+      }
+
+      // Notification to admins
+      const adminIds = await getAdmins(companyId, userId);
+
+      await Notification.create({
+        userId: userId,
+        targetUsers: adminIds,
+        actionType: reportId ? 'update_daily_report' : 'send_daily_report',
+        description: reportId
+          ? `قام المستخدم ${username} بتحديث تقريره اليومي.`
+          : `قام المستخدم ${username} بإرسال تقريره اليومي بنجاح.`,
+        relatedEntity: {
+          entityType: 'DailyReport',
+          entityId: report._id
+        },
+        data: {
+          date: dateStr,
+          repName: username,
+          visitsCount: stats.totalVisits,
+          completedVisits: stats.completedVisits
+        }
+      }).catch(err => console.error('Notification error:', err));
+
+      // Handle samples
+      const { samplesCount, invalidSamples } = await handleSamples(
+        samples,
+        report,
+        userId,
+        companyId,
+        deletedSamples
+      );
+
+      return sendSuccess(
+        res,
+        reportId ? 200 : 201,
+        reportId ? '✅ تم تحديث التقرير بنجاح' : '✅ تم إنشاء التقرير بنجاح',
+        {
+          report,
+          samplesCount,
+          invalidSamples
+        }
+      );
+    }
+
+    // ADMIN LOGIC
+    if (role === 'admin') {
+      if (!reportId) return sendError(res, 400, '📛 يجب تقديم معرف التقرير للتحديث');
+
+      const report = await DailyReport.findOne({ _id: reportId, companyId });
+      if (!report) return sendError(res, 404, '❌ التقرير غير موجود أو لا ينتمي لشركتك');
+
+      const processedVisits = await processVisitsForSalesRep(cleanedVisits, report.repId, companyId, day);
+      const stats = calculateVisitStats(processedVisits);
+
+      report.notes = notes || report.notes;
+      report.visits = processedVisits;
+      report.stats = stats;
+
+      // أضف الصور للـ report.images (نجمع الصور القديمة مع الجديدة)
+      report.images = [...(report.images || []), ...images];
+
+      await report.save();
+
+      // Handle samples for admin
+      const { samplesCount } = await handleSamples(samples, report, userId, companyId);
+
+      return sendSuccess(res, 200, '✅ تم تحديث التقرير بنجاح بواسطة المدير', {
+        report,
+        samplesCount
+      });
+    }
+
+    return sendError(res, 403, '🚫 غير مصرح لك بهذا الإجراء');
+  } catch (error) {
+    console.error('❌ Error in createOrUpdateReport:', error);
+    return sendError(res, 500, '❌ خطأ في الخادم الداخلي');
+  }
+}; Product.js const mongoose = require('mongoose');
+
+const productSchema = new mongoose.Schema(
+  {
+    name: { type: String, required: true, trim: true },
+    description: { type: String, trim: true },
+    companyId: { type: mongoose.Schema.Types.ObjectId, ref: 'Company', required: true },
+    unitType: {
+      type: String,
+      enum: ['كرتونة', 'علبة', 'حبة', 'ربطة'],
+      required: true
+    },
+    weight: { type: Number },
+    weightUnit: {
+      type: String,
+      enum: ['كيلو', 'جرام', 'مليلتر', 'لتر'],
+      required: function () {
+        return this.weight !== undefined;
+      }
+    },
+    isActive: { type: Boolean, default: true }
+  },
+  { timestamps: true }
+);
+
+module.exports = mongoose.model('Product', productSchema);
+ RepProductStock.js const { Schema, model, Types } = require('mongoose');
+
+const repProductStockSchema = new Schema({
+  companyId: {
+    type: Types.ObjectId,
+    ref: 'Company',
+    required: true
+  },
+  repId: {
+    type: Types.ObjectId,
+    ref: 'User',
+    required: true
+  },
+  productId: {
+    type: Types.ObjectId,
+    ref: 'Product',
+    required: true
+  },
+  quantity: {
+    type: Number,
+    default: 0,
+    min: 0
+  }
+}, {
+  timestamps: true
+});
+
+// تأكد من وجود index على الثلاث حقول عشان تسريع البحث
+repProductStockSchema.index({ companyId: 1, repId: 1, productId: 1 }, { unique: true });
+
+module.exports = model('RepProductStock', repProductStockSchema);
+ RepStockHistory.js const { Schema, model, Types } = require('mongoose');
+
+const repStockHistorySchema = new Schema({
+  companyId: {
+    type: Types.ObjectId,
+    ref: 'Company',
+    required: true
+  },
+  repId: {
+    type: Types.ObjectId,
+    ref: 'User',
+    required: true
+  },
+  productId: {
+    type: Types.ObjectId,
+    ref: 'Product',
+    required: true
+  },
+  quantityChange: {
+    type: Number,
+    required: true,
+  },
+  reason: {
+    type: String,
+    default: '',
+    trim: true
+  },
+  addedBy: {
+    type: Types.ObjectId,
+    ref: 'User',
+    required: true
+  },
+  includeInAnalysis: {
+    type: Boolean,
+    default: false
+  }
+}, {
+  timestamps: true
+});
+
+// index لتحسين أداء الفلترة والتجميع
+repStockHistorySchema.index({ companyId: 1, repId: 1, productId: 1, createdAt: -1 });
+
+module.exports = model('RepStockHistory', repStockHistorySchema);
+ Sample.js const { Schema, model, Types } = require('mongoose');
+
+const sampleSchema = new Schema({
+  companyId: {
+    type: Types.ObjectId,
+    ref: 'Company',
+    required: true
+  },
+  takenBy: {
+    type: Types.ObjectId,
+    ref: 'User',
+    required: true
+  },
+  productId: {
+    type: Types.ObjectId,
+    ref: 'Product',
+    required: true
+  },
+  quantity: {
+    type: Number,
+    required: true,
+    min: 1
+  },
+  type: {
+    type: String,
+    enum: ['customer', 'personal'],
+    required: true
+  },
+  customerId: {
+    type: Types.ObjectId,
+    ref: 'Customer'
+  },
+  reportId: {
+    type: Types.ObjectId,
+    ref: 'DailyReport'
+  },
+  visitId: {
+    type: Types.ObjectId,
+    ref: 'Visit'
+  },
+  notes: {
+    type: String,
+    default: ''
+  }
+}, {
+  timestamps: true
+});
+
+sampleSchema.index({ companyId: 1, takenBy: 1, productId: 1, createdAt: -1 });
+
+module.exports = model('Sample', sampleSchema);

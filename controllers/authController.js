@@ -4,7 +4,6 @@ const { now, parseWithTZ } = require('../utils/dayjs');
 const LoginLog = require('../models/LoginLog');
 const getLocation = require('../utils/getLocation');
 const Notification = require('../models/Notification');
-
 require('dotenv').config();
 
 const JWT_SECRET = process.env.JWT_SECRET;
@@ -45,7 +44,7 @@ const loginUser = async (req, res) => {
     }
 
     if (user.isActive === false) {
-      return res.status(403).json({ message: '🚫 تم تعطيل حسابك مؤقتًا، تواصل مع المسئول' });
+      return res.status(403).json({ message: '🚫 تم تعطيل حسابك مؤقتًا، تواصل مع المسؤول' });
     }
 
     const isMatch = await user.comparePassword(password);
@@ -231,6 +230,21 @@ const logoutSpecificSession = async (req, res) => {
   }
 };
 
+const logoutUser = async (req, res) => {
+  try {
+    await LoginLog.findOneAndUpdate(
+      { token: req.token, tokenIsActive: true },
+      { tokenIsActive: false }
+    );
+
+    res.status(200).json({ 
+      message: `✅ تم تسجيل الخروج بنجاح ${req.user.fullName}` 
+    });
+  } catch (error) {
+    res.status(500).json({ message: '❌ خطأ أثناء تسجيل الخروج', error: error.message });
+  }
+};
+
 const verifyPassword = async (req, res) => {
   try {
     const { password } = req.body;
@@ -258,21 +272,6 @@ const verifyPassword = async (req, res) => {
 
   } catch (err) {
     return res.status(500).json({ message: 'Server error' });
-  }
-};
-
-const logoutUser = async (req, res) => {
-  try {
-    await LoginLog.findOneAndUpdate(
-      { token: req.token, tokenIsActive: true },
-      { tokenIsActive: false }
-    );
-
-    res.status(200).json({ 
-      message: `✅ تم تسجيل الخروج بنجاح ${req.user.fullName}` 
-    });
-  } catch (error) {
-    res.status(500).json({ message: '❌ خطأ أثناء تسجيل الخروج', error: error.message });
   }
 };
 

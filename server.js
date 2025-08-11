@@ -1,8 +1,6 @@
 const express = require('express');
-const path = require('path');
 const dotenv = require('dotenv');
 const rateLimit = require('express-rate-limit');
-const helmet = require('helmet');
 const cors = require('cors');
 const morgan = require('morgan');
 
@@ -14,7 +12,9 @@ const connectDB = require('./config/db');
 
 // Route imports
 const companyRoutes = require('./routes/companyRoutes');
+const productRoutes = require('./routes/productRoutes');
 const userRoutes = require('./routes/userRoutes');
+const exportRoutes = require('./routes/exportRoutes');
 const customerRoutes = require('./routes/customerRoutes');
 const authRoutes = require('./routes/authRoutes');
 const visit_plansRoutes = require('./routes/visitPlanRoutes');
@@ -25,13 +25,18 @@ const Notification = require('./routes/NotificationRoutes');
 const Subscription = require('./routes/SubscriptionRoutes');
 const Stats = require('./routes/statsRoutes');
 const Permissions = require('./routes/permissionRoutes');
+const repProductStockRoutes = require('./routes/repProductStockRoutes');
 
 const app = express();
 const PORT = process.env.PORT || 5000;
 
 // Middleware
-app.use(helmet());
-app.use(cors());
+
+app.use(cors({
+  origin: 'https://mandoobipro.netlify.app',
+  credentials: true
+}));
+
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 app.use(morgan('dev'));
@@ -45,6 +50,7 @@ app.use(limiter);
 
 // API Routes
 app.use('/api/companies', companyRoutes);
+app.use('/api/products', productRoutes);
 app.use('/api/users', userRoutes);
 app.use('/api/customers', customerRoutes);
 app.use('/api/auth', authRoutes);
@@ -55,16 +61,14 @@ app.use('/api/updates', updateRoutes);
 app.use('/api/notification', Notification);
 app.use('/api/Subscription', Subscription);
 app.use('/api/stats', Stats);
+app.use('/api/exports', exportRoutes);
 app.use('/api/permissions', Permissions);
+app.use('/api/stocks', repProductStockRoutes);
 
 // Error handling middleware
 app.use((err, req, res, next) => {
   console.error(err.stack);
   res.status(500).send('Something broke!');
-});
-
-app.get('*', (req, res) => {
-  res.sendFile(path.join(__dirname, 'public', 'index.html'));
 });
 
 // Start server

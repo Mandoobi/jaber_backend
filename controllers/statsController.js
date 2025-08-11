@@ -1,5 +1,6 @@
 const mongoose = require('mongoose');
 const User = require('../models/User');
+const CustomerAssignment = require('../models/CustomerAssignment');
 const DailyReport = require('../models/DailyReport');
 const VisitPlan = require('../models/VisitPlan'); // تأكد أنك مستورد الموديل
 const Customer = require('../models/Customer');
@@ -24,7 +25,7 @@ const getAdminStats = async (req, res) => {
     ]);
 
     const completedVisits = completedVisitsAgg.length > 0 ? completedVisitsAgg[0].completedVisits : 0;
-    const pendingTasks = 5; // موقتا!!!
+    const pendingTasks = 0; // موقتا!!!
 
     return res.status(200).json({
       success: true,
@@ -44,10 +45,10 @@ const getAdminStats = async (req, res) => {
 
 const getSalesStats = async (req, res) => {
   try {
-    const { companyId, userId } = req.user;
+    const { companyId, userId, role } = req.user;
     const today = now().format('dddd'); // "Sunday", "Monday", ...
 
-    // 🟡 جلب خطة الزيارات
+    // 🟡 جلب خط الزيارات
     const visitPlan = await VisitPlan.findOne({ repId: userId, companyId }).lean();
     if (!visitPlan) {
       return res.status(200).json({
@@ -56,7 +57,8 @@ const getSalesStats = async (req, res) => {
           customersToVisitToday: 0,
           reportSubmittedToday: false,
           assignedTasks: 0,
-          message: '❌ لم يتم إنشاء خطة زيارات لهذا المندوب'
+          totalCustomers: 0,
+          message: '❌ لم يتم إنشاء خط زيارات لهذا المندوب'
         }
       });
     }
@@ -69,6 +71,7 @@ const getSalesStats = async (req, res) => {
           customersToVisitToday: 0,
           reportSubmittedToday: false,
           assignedTasks: 0,
+          totalCustomers: 0,
           message: `❌ لم يتم تحديد زيارات لهذا اليوم (${today})`
         }
       });
@@ -85,15 +88,42 @@ const getSalesStats = async (req, res) => {
       date: todayDate
     });
 
+    // Get total customers count
+    let totalCustomers;
+    if (role === 'rep' || role === 'sales') {
+      // For reps, count only their assigned customers + public ones
+      const companyCustomerIds = await Customer.find({ companyId }).distinct('_id');
+      const assignedCustomerIds = await CustomerAssignment.distinct('customerId', {
+        repId: userId,
+        customerId: { $in: companyCustomerIds }
+      });
+
+      totalCustomers = await Customer.countDocuments({
+        companyId,
+        isActive: true,
+        $or: [
+          { isPublic: true },
+          { _id: { $in: assignedCustomerIds } }
+        ]
+      });
+    } else {
+      // For admins, count all active customers
+      totalCustomers = await Customer.countDocuments({
+        companyId,
+        isActive: true
+      });
+    }
+
     // المهام مؤقتًا 0
-    const assignedTasks = 7;
+    const assignedTasks = 0;
 
     return res.status(200).json({
       success: true,
       data: {
         customersToVisitToday,
         reportSubmittedToday: !!reportSubmittedToday,
-        assignedTasks
+        assignedTasks,
+        totalCustomers
       }
     });
 

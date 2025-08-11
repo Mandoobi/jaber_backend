@@ -44,6 +44,24 @@ const customerSchema = new mongoose.Schema(
       default: true,
       index: true
     },
+    managerName: {
+      type: String,
+      required: false // This is optional by default, but explicitly stating it
+    },
+    isPublic: {
+      type: Boolean,
+      default: false,
+      index: true
+    },
+    customer_code: {
+      type: String,
+      trim: true,
+      unique: true,
+      sparse: true, // تسمح بتركيه فاضي بدون كسر الـ unique
+      minlength: 3,
+      maxlength: 20,
+      match: /^[A-Z0-9\-]+$/ // أحرف كابيتال، أرقام، و"-" فقط
+    }
   },
   { timestamps: true }
 );

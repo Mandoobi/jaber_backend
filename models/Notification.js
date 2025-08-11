@@ -22,6 +22,8 @@ const notificationSchema = new mongoose.Schema({
       'send_daily_report',
       'missed_daily_report',
       'reminder_to_send_report',
+      'update_daily_report',
+      'delete_report'
     ],
     required: true
   },

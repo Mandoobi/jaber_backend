@@ -17,6 +17,10 @@ const dailyReportSchema = new Schema({
         enum: ['Sunday', 'Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday'],
         required: true
   },
+  images: {
+    type: [String], // مصفوفة روابط الصور من Cloudinary
+    validate: [arrayLimit, '{PATH} exceeds the limit of 3']
+  },
   notes: { // it will come from the USER
     type: String,
     default: ''
@@ -36,6 +40,10 @@ const dailyReportSchema = new Schema({
       },
       reason: {
         type: String // optional، سبب عدم الزيارة لو status = not_visited
+      },
+       customerCode: { // Add this field
+        type: String,
+        default: null
       },
       notes: {
         type: String,
@@ -59,5 +67,9 @@ const dailyReportSchema = new Schema({
 }, {
   timestamps: true  // تضيف createdAt و updatedAt تلقائي
 });
+
+function arrayLimit(val) {
+  return val.length <= 3; // ما بسمح بأكثر من 3 صور
+}
 
 module.exports = model('DailyReport', dailyReportSchema);
